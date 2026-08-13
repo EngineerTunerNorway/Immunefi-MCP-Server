@@ -3,9 +3,10 @@ import json
 import sys
 import types
 import unittest
+from pathlib import Path
 
 
-MODULE_PATH = "/home/runner/work/Immunefi-MCP-Server/Immunefi-MCP-Server/main.py"
+MODULE_PATH = Path(__file__).resolve().parents[1] / "main.py"
 
 
 def load_main_module():
@@ -32,7 +33,7 @@ def load_main_module():
         def __init__(self, name):
             self.name = name
 
-        def tool(self):
+        def tool(self, *args, **kwargs):
             def deco(fn):
                 return fn
 
@@ -46,7 +47,7 @@ def load_main_module():
     sys.modules["mcp.server"] = server_mod
     sys.modules["mcp.server.fastmcp"] = fastmcp_mod
 
-    spec = importlib.util.spec_from_file_location("main", MODULE_PATH)
+    spec = importlib.util.spec_from_file_location("main", str(MODULE_PATH))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -63,6 +64,9 @@ class HardenedServerTests(unittest.TestCase):
 
     def test_max_bounty_handles_null(self):
         self.assertIsNone(self.main._max_bounty({"maxBounty": None}))
+
+    def test_epoch_ms_normalizes_seconds_input(self):
+        self.assertEqual(self.main._epoch_ms(1_700_000_000), 1_700_000_000_000)
 
     def test_response_size_cap_returns_error(self):
         payload = {"body": "a" * (self.main.MAX_RESPONSE_BYTES + 1000)}

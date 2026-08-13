@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import time
+from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 
 import httpx
@@ -73,14 +74,16 @@ def _validate_ids(project_ids: List[str]) -> Optional[str]:
 async def _load() -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     """Fetch + cache bounties, and build an id/slug index. Single-flight."""
     global _cache, _index, _cache_time
+    cache, index, cache_time = _cache, _index, _cache_time
     now = time.monotonic()
-    if _cache is not None and _cache_time is not None and now - _cache_time < CACHE_DURATION:
-        return _cache, _index
+    if cache is not None and cache_time is not None and now - cache_time < CACHE_DURATION:
+        return cache, index
 
     async with _lock:
+        cache, index, cache_time = _cache, _index, _cache_time
         now = time.monotonic()
-        if _cache is not None and _cache_time is not None and now - _cache_time < CACHE_DURATION:
-            return _cache, _index  # another coroutine refreshed while we waited
+        if cache is not None and cache_time is not None and now - cache_time < CACHE_DURATION:
+            return cache, index  # another coroutine refreshed while we waited
 
         logger.info("fetching bounties from Immunefi")
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=False) as client:
@@ -123,16 +126,19 @@ async def _resolve(project_ids: List[str]) -> Tuple[Optional[str], List[Tuple[st
 
 def _epoch_ms(value: Any) -> Optional[int]:
     """Normalize int|float|numeric-str|ISO-str -> epoch ms. None if unparseable."""
+    def _normalize_numeric(n: int) -> int:
+        # Heuristic: epoch seconds are ~1e9-1e10, epoch ms are ~1e12+.
+        return n * 1000 if abs(n) < 100_000_000_000 else n
+
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, (int, float)):
-        return int(value)
+        return _normalize_numeric(int(value))
     if isinstance(value, str):
         s = value.strip()
         if s.isdigit():
-            return int(s)
+            return _normalize_numeric(int(s))
         try:
-            from datetime import datetime
             return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp() * 1000)
         except ValueError:
             return None
@@ -449,13 +455,13 @@ async def search_updated_since(days: Optional[int] = None, months: Optional[int]
         date: ISO cutoff, e.g. "2026-06-01"
         project_ids: restrict the search to these ids (optional)
     """
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
 
     given = [x is not None for x in (days, months, date)]
     if sum(given) != 1:
         return _err("specify exactly one of days, months, or date")
 
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     if days is not None:
         if days <= 0:
             return _err("days must be positive")
@@ -469,6 +475,10 @@ async def search_updated_since(days: Optional[int] = None, months: Optional[int]
             cutoff = datetime.fromisoformat(date.replace("Z", "+00:00"))
         except ValueError:
             return _err(f"invalid date: {date!r}; use ISO format e.g. 2026-06-01")
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=timezone.utc)
+        else:
+            cutoff = cutoff.astimezone(timezone.utc)
         label = date
 
     cutoff_ms = int(cutoff.timestamp() * 1000)
@@ -494,21 +504,22 @@ async def search_updated_since(days: Optional[int] = None, months: Optional[int]
             unparseable += 1
             continue
         if ms >= cutoff_ms:
-            matching.append({
-                "id": rec.get("id") or rec.get("slug"),
-                "updated_date": rec.get("updatedDate"),
-                "_sort": ms,
-            })
+            matching.append((
+                ms,
+                {
+                    "id": rec.get("id") or rec.get("slug"),
+                    "updated_date": rec.get("updatedDate"),
+                },
+            ))
 
-    matching.sort(key=lambda x: x["_sort"], reverse=True)  # normalized int key, never mixed
-    for m in matching:
-        m.pop("_sort", None)
+    matching.sort(key=lambda x: x[0], reverse=True)  # normalized int key, never mixed
+    matching_programs = [row for _, row in matching]
 
     return _ok({
         "time_period": label,
         "cutoff_date": cutoff.isoformat(),
-        "matching_programs": matching,
-        "count": len(matching),
+        "matching_programs": matching_programs,
+        "count": len(matching_programs),
         "unparseable_dates": unparseable,
     })
 
